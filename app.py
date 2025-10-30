@@ -37,6 +37,8 @@ if submitted:
         }
 
         token_response = requests.post(token_url, params=params)
+        st.write("🔍 Token response from Zoho:")
+        st.json(token_response.json())
 
         if token_response.status_code == 200:
             tokens = token_response.json()
