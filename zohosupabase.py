@@ -2,126 +2,119 @@ import streamlit as st
 import requests
 import pandas as pd
 from datetime import datetime
-from supabase import create_client
+from supabase import create_client, Client
 
-# ---------------- CONFIG ----------------
-st.title("🧾 Zoho Books ↔ Supabase Sync")
-st.caption("Incremental sync with audit logging")
+st.set_page_config(page_title="Zoho ↔ Supabase Sync", page_icon="🔄", layout="wide")
 
-# Load from Streamlit Secrets
-zoho_org_id = st.secrets["zoho"]["organization_id"]
-access_token = st.secrets["zoho"]["access_token"]
-supabase_url = st.secrets["supabase"]["url"]
-supabase_key = st.secrets["supabase"]["anon_key"]
+# ---------- CONFIG ----------
+ZOHO_CLIENT_ID = st.secrets["ZOHO_CLIENT_ID"]
+ZOHO_CLIENT_SECRET = st.secrets["ZOHO_CLIENT_SECRET"]
+ZOHO_REFRESH_TOKEN = st.secrets["ZOHO_REFRESH_TOKEN"]
+ZOHO_ORGANIZATION_ID = st.secrets["ZOHO_ORGANIZATION_ID"]
+ZOHO_BASE_URL = st.secrets["ZOHO_BASE_URL"]
 
-# Initialize Supabase client
-supabase = create_client(supabase_url, supabase_key)
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
 
-# ---------------- FETCH ZOHO ITEMS ----------------
-def fetch_all_zoho_items():
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# ---------- ZOHO AUTH ----------
+@st.cache_data(ttl=3000)
+def get_access_token():
+    """Exchange refresh token for access token"""
+    token_url = "https://accounts.zoho.com/oauth/v2/token"
+    payload = {
+        "refresh_token": ZOHO_REFRESH_TOKEN,
+        "client_id": ZOHO_CLIENT_ID,
+        "client_secret": ZOHO_CLIENT_SECRET,
+        "grant_type": "refresh_token"
+    }
+    r = requests.post(token_url, data=payload)
+    if r.status_code == 200:
+        return r.json().get("access_token")
+    else:
+        st.error(f"Auth error: {r.text}")
+        return None
+
+# ---------- ZOHO DATA FETCH ----------
+def fetch_all_items():
+    """Fetch all items from Zoho Books (auto-paginate)"""
+    access_token = get_access_token()
+    if not access_token:
+        st.error("Access token not found.")
+        return []
+
     headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
-    all_items = []
+    items = []
     page = 1
+
     while True:
-        res = requests.get(
-            f"https://books.zoho.com/api/v3/items?organization_id={zoho_org_id}&page={page}",
-            headers=headers,
+        resp = requests.get(
+            f"{ZOHO_BASE_URL}/items?organization_id={ZOHO_ORGANIZATION_ID}&page={page}",
+            headers=headers
         )
-        data = res.json()
-        if "items" not in data:
-            st.error(data)
+        if resp.status_code != 200:
+            st.error(f"Error fetching items: {resp.text}")
             break
-        items = data["items"]
-        all_items.extend(items)
-        if len(items) < 200:
+        data = resp.json()
+        page_items = data.get("items", [])
+        if not page_items:
+            break
+        items.extend(page_items)
+        if not data.get("page_context", {}).get("has_more_page"):
             break
         page += 1
-    return all_items
 
-# ---------------- SYNC LOGIC ----------------
-def sync_items():
-    st.info("🔄 Fetching Zoho items...")
-    zoho_items = fetch_all_zoho_items()
-    zoho_df = pd.DataFrame(zoho_items)
+    return items
 
-    # Fetch existing data from Supabase
-    st.info("📦 Fetching Supabase data...")
-    existing = supabase.table("items_core").select("*").execute().data
-    existing_df = pd.DataFrame(existing) if existing else pd.DataFrame()
-
-    new_items, updated_items, deleted_items = [], [], []
-
-    # Convert to dict keyed by item_id
-    zoho_map = {item["item_id"]: item for item in zoho_items}
-    existing_map = {item["item_id"]: item for item in existing} if existing else {}
-
-    # Detect additions and updates
-    for item_id, item in zoho_map.items():
-        if item_id not in existing_map:
-            new_items.append(item)
-        else:
-            existing_item = existing_map[item_id]
-            if any(item.get(k) != existing_item.get(k) for k in item.keys()):
-                updated_items.append(item)
-
-    # Detect deletions
-    for item_id in existing_map.keys():
-        if item_id not in zoho_map:
-            deleted_items.append(existing_map[item_id])
-
-    # Apply changes
-    if new_items:
-        supabase.table("items_core").upsert(new_items).execute()
-    if updated_items:
-        supabase.table("items_core").upsert(updated_items).execute()
-    if deleted_items:
-        for d in deleted_items:
-            supabase.table("items_core").delete().eq("item_id", d["item_id"]).execute()
-
-    # Log changes to audit table
-    audit_logs = []
-    now = datetime.utcnow().isoformat()
-    for i in new_items:
-        audit_logs.append({"change_type": "INSERT", "item_id": i["item_id"], "changed_at": now})
-    for i in updated_items:
-        audit_logs.append({"change_type": "UPDATE", "item_id": i["item_id"], "changed_at": now})
-    for i in deleted_items:
-        audit_logs.append({"change_type": "DELETE", "item_id": i["item_id"], "changed_at": now})
-
-    if audit_logs:
-        supabase.table("audit_change_log").insert(audit_logs).execute()
-
-    # Update sync metadata
-    supabase.table("sync_metadata").upsert(
-        {
-            "table_name": "items_core",
-            "last_synced_at": now,
-            "inserted_count": len(new_items),
-            "updated_count": len(updated_items),
-            "deleted_count": len(deleted_items),
+# ---------- UPSERT TO SUPABASE ----------
+def upsert_items(items):
+    """Upsert Zoho items into Supabase"""
+    for item in items:
+        record = {
+            "item_id": item.get("item_id"),
+            "organization_id": ZOHO_ORGANIZATION_ID,
+            "name": item.get("name"),
+            "sku": item.get("sku"),
+            "hsn_or_sac": item.get("hsn_or_sac"),
+            "status": item.get("status"),
+            "product_type": item.get("product_type"),
+            "item_type": item.get("item_type"),
+            "unit": item.get("unit"),
+            "purchase_rate": item.get("purchase_rate"),
+            "purchase_account_name": item.get("purchase_account_name"),
+            "selling_rate": item.get("rate"),
+            "selling_account_name": item.get("account_name"),
+            "is_taxable": item.get("is_taxable"),
+            "tax_percentage": item.get("tax_percentage"),
+            "created_time": item.get("created_time"),
+            "last_modified_time": item.get("last_modified_time"),
+            "last_synced_at": datetime.utcnow().isoformat(),
+            "raw_json": item
         }
-    ).execute()
 
-    st.success(
-        f"✅ Sync Complete!\nInserted: {len(new_items)} | Updated: {len(updated_items)} | Deleted: {len(deleted_items)}"
-    )
+        supabase.table("items_core").upsert(record).execute()
 
-# ---------------- STREAMLIT UI ----------------
-if st.button("🔁 Run Incremental Sync"):
-    sync_items()
+# ---------- UI ----------
+st.title("📦 Zoho Books → Supabase Sync Dashboard")
 
-# Show current items
-st.subheader("📋 Current items from Supabase")
-data = supabase.table("items_core").select("*").limit(100).execute().data
-if data:
-    st.dataframe(pd.DataFrame(data))
+if st.button("🔄 Refresh / Sync Now"):
+    with st.spinner("Syncing data from Zoho Books..."):
+        items = fetch_all_items()
+        if items:
+            upsert_items(items)
+            st.success(f"✅ Synced {len(items)} items successfully!")
+
+# ---------- DISPLAY DATA ----------
+with st.spinner("Loading all items from Supabase..."):
+    data = supabase.table("items_core").select("*").execute()
+    df = pd.DataFrame(data.data)
+
+if not df.empty:
+    # Convert timestamp fields to datetime and sort
+    if "last_modified_time" in df.columns:
+        df["last_modified_time"] = pd.to_datetime(df["last_modified_time"], errors="coerce")
+        df = df.sort_values(by="last_modified_time", ascending=False)
+    st.dataframe(df, use_container_width=True)
 else:
-    st.warning("No items found in Supabase yet.")
-
-# Show recent audit log
-st.subheader("🧠 Audit Log (last 10 changes)")
-logs = supabase.table("audit_change_log").select("*").order("changed_at", desc=True).limit(10).execute().data
-if logs:
-    st.dataframe(pd.DataFrame(logs))
-else:
-    st.caption("No changes logged yet.")
+    st.info("No items found in Supabase yet.")
