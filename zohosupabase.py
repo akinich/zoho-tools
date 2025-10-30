@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 from supabase import create_client, Client
 
+# ---------- PAGE CONFIG ----------
 st.set_page_config(page_title="Zoho ↔ Supabase Sync", page_icon="🔄", layout="wide")
 
 # ---------- CONFIG ----------
@@ -106,6 +107,8 @@ if st.button("🔄 Refresh / Sync Now"):
             st.success(f"✅ Synced {len(items)} items successfully!")
 
 # ---------- DISPLAY DATA ----------
+st.subheader("📊 Items in Supabase")
+
 with st.spinner("Loading all items from Supabase..."):
     data = supabase.table("items_core").select("*").execute()
     df = pd.DataFrame(data.data)
@@ -115,6 +118,18 @@ if not df.empty:
     if "last_modified_time" in df.columns:
         df["last_modified_time"] = pd.to_datetime(df["last_modified_time"], errors="coerce")
         df = df.sort_values(by="last_modified_time", ascending=False)
+
+    # ---------- SEARCH ----------
+    search_query = st.text_input("🔍 Search by Name, SKU, or HSN/SAC").strip().lower()
+    if search_query:
+        df = df[
+            df["name"].str.lower().str.contains(search_query, na=False)
+            | df["sku"].astype(str).str.lower().str.contains(search_query, na=False)
+            | df["hsn_or_sac"].astype(str).str.lower().str.contains(search_query, na=False)
+        ]
+
+    # ---------- DISPLAY ----------
+    st.caption(f"Total items: {len(df)}")
     st.dataframe(df, use_container_width=True)
 else:
     st.info("No items found in Supabase yet.")
