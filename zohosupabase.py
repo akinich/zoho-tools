@@ -21,6 +21,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 # ---------- ZOHO AUTH ----------
 @st.cache_data(ttl=3000)
 def get_access_token():
+    """Exchange refresh token for access token"""
     token_url = "https://accounts.zoho.com/oauth/v2/token"
     payload = {
         "refresh_token": ZOHO_REFRESH_TOKEN,
@@ -37,6 +38,7 @@ def get_access_token():
 
 # ---------- ZOHO DATA FETCH ----------
 def fetch_all_items():
+    """Fetch all items from Zoho Books (auto-paginate)"""
     access_token = get_access_token()
     if not access_token:
         st.error("Access token not found.")
@@ -67,6 +69,7 @@ def fetch_all_items():
 
 # ---------- UPSERT TO SUPABASE ----------
 def upsert_items(items):
+    """Upsert Zoho items into Supabase"""
     for item in items:
         record = {
             "item_id": item.get("item_id"),
@@ -103,11 +106,15 @@ if st.button("🔄 Refresh / Sync Now"):
             st.success(f"✅ Synced {len(items)} items successfully!")
 
 # ---------- DISPLAY DATA ----------
-with st.spinner("Loading items from Supabase..."):
-    data = supabase.table("items_core").select("*").limit(100).execute()
+with st.spinner("Loading all items from Supabase..."):
+    data = supabase.table("items_core").select("*").execute()
     df = pd.DataFrame(data.data)
 
 if not df.empty:
+    # Convert timestamp fields to datetime and sort
+    if "last_modified_time" in df.columns:
+        df["last_modified_time"] = pd.to_datetime(df["last_modified_time"], errors="coerce")
+        df = df.sort_values(by="last_modified_time", ascending=False)
     st.dataframe(df, use_container_width=True)
 else:
     st.info("No items found in Supabase yet.")
