@@ -1,13 +1,12 @@
 import streamlit as st
 import requests
 import pandas as pd
-import time
 from datetime import datetime
 from supabase import create_client
 
 # ---------------- CONFIG ----------------
 st.title("🧾 Zoho Books ↔ Supabase Sync")
-st.caption("Incremental sync with audit logging and progress tracking")
+st.caption("Incremental sync with audit logging")
 
 # Load from Streamlit Secrets
 zoho_org_id = st.secrets["zoho"]["organization_id"]
@@ -23,13 +22,7 @@ def fetch_all_zoho_items():
     headers = {"Authorization": f"Zoho-oauthtoken {access_token}"}
     all_items = []
     page = 1
-    max_pages = 20  # prevent infinite loops
-    progress = st.progress(0)
-    status_text = st.empty()
-    start_time = time.time()
-
     while True:
-        status_text.text(f"Fetching Zoho items... Page {page}")
         res = requests.get(
             f"https://books.zoho.com/api/v3/items?organization_id={zoho_org_id}&page={page}",
             headers=headers,
@@ -40,29 +33,19 @@ def fetch_all_zoho_items():
             break
         items = data["items"]
         all_items.extend(items)
-
-        # update progress bar
-        progress.progress(min(page / max_pages, 1.0))
         if len(items) < 200:
             break
         page += 1
-        if page > max_pages:
-            break
-
-    elapsed = time.time() - start_time
-    status_text.text(f"Fetched {len(all_items)} items in {elapsed:.1f} seconds ✅")
     return all_items
-
 
 # ---------------- SYNC LOGIC ----------------
 def sync_items():
-    st.info("🔄 Starting incremental sync...")
-    start_time = time.time()
-
+    st.info("🔄 Fetching Zoho items...")
     zoho_items = fetch_all_zoho_items()
     zoho_df = pd.DataFrame(zoho_items)
 
     # Fetch existing data from Supabase
+    st.info("📦 Fetching Supabase data...")
     existing = supabase.table("items_core").select("*").execute().data
     existing_df = pd.DataFrame(existing) if existing else pd.DataFrame()
 
@@ -72,10 +55,6 @@ def sync_items():
     zoho_map = {item["item_id"]: item for item in zoho_items}
     existing_map = {item["item_id"]: item for item in existing} if existing else {}
 
-    total_ops = len(zoho_items) + len(existing_map)
-    progress = st.progress(0)
-    ops_done = 0
-
     # Detect additions and updates
     for item_id, item in zoho_map.items():
         if item_id not in existing_map:
@@ -84,15 +63,11 @@ def sync_items():
             existing_item = existing_map[item_id]
             if any(item.get(k) != existing_item.get(k) for k in item.keys()):
                 updated_items.append(item)
-        ops_done += 1
-        progress.progress(min(ops_done / total_ops, 1.0))
 
     # Detect deletions
     for item_id in existing_map.keys():
         if item_id not in zoho_map:
             deleted_items.append(existing_map[item_id])
-        ops_done += 1
-        progress.progress(min(ops_done / total_ops, 1.0))
 
     # Apply changes
     if new_items:
@@ -103,9 +78,9 @@ def sync_items():
         for d in deleted_items:
             supabase.table("items_core").delete().eq("item_id", d["item_id"]).execute()
 
-    # Log changes
-    now = datetime.utcnow().isoformat()
+    # Log changes to audit table
     audit_logs = []
+    now = datetime.utcnow().isoformat()
     for i in new_items:
         audit_logs.append({"change_type": "INSERT", "item_id": i["item_id"], "changed_at": now})
     for i in updated_items:
@@ -116,7 +91,7 @@ def sync_items():
     if audit_logs:
         supabase.table("audit_change_log").insert(audit_logs).execute()
 
-    # Update metadata
+    # Update sync metadata
     supabase.table("sync_metadata").upsert(
         {
             "table_name": "items_core",
@@ -127,18 +102,15 @@ def sync_items():
         }
     ).execute()
 
-    total_time = time.time() - start_time
     st.success(
-        f"✅ Sync Complete in {total_time:.1f}s! | Inserted: {len(new_items)} | Updated: {len(updated_items)} | Deleted: {len(deleted_items)}"
+        f"✅ Sync Complete!\nInserted: {len(new_items)} | Updated: {len(updated_items)} | Deleted: {len(deleted_items)}"
     )
-
 
 # ---------------- STREAMLIT UI ----------------
 if st.button("🔁 Run Incremental Sync"):
     sync_items()
 
-st.divider()
-
+# Show current items
 st.subheader("📋 Current items from Supabase")
 data = supabase.table("items_core").select("*").limit(100).execute().data
 if data:
@@ -146,6 +118,7 @@ if data:
 else:
     st.warning("No items found in Supabase yet.")
 
+# Show recent audit log
 st.subheader("🧠 Audit Log (last 10 changes)")
 logs = supabase.table("audit_change_log").select("*").order("changed_at", desc=True).limit(10).execute().data
 if logs:
